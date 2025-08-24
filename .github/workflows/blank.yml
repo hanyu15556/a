@@ -1,0 +1,37 @@
+name: manjaro-arm64-rootfs
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '30 1 * * 1'
+
+env:
+  EXTRA_PKGS: util-linux sed sudo systemd supervisor tar xz gzip ca-certificates ca-certificates-utils nano vim
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      - id: date
+        run: echo "tag=$(date +%Y%m%d)" >> "$GITHUB_OUTPUT"
+      - run: |
+          docker run --rm --privileged --platform linux/arm64/v8 \
+            -e EXTRA_PKGS="$EXTRA_PKGS" -e TAG="${{ steps.date.outputs.tag }}" \
+            -v "$PWD":/out manjarolinux/base:latest bash -euxc '
+              pacman -Sy --noconfirm arch-install-scripts
+              pacman-key --init
+              pacman-key --populate manjaro archlinuxarm
+              mkdir -p /tmp/rootfs
+              pacstrap -c -G -M /tmp/rootfs base ${EXTRA_PKGS}
+              rm -f /tmp/rootfs/etc/machine-id
+              pacman -Scc --noconfirm -r /tmp/rootfs
+              tar --numeric-owner -czpf /out/manjaro-arm64-${TAG}.tar.gz -C /tmp/rootfs .
+            '
+      - uses: softprops/action-gh-release@v0.1.15
+        with:
+          tag_name: ${{ steps.date.outputs.tag }}
+          files: manjaro-arm64-${{ steps.date.outputs.tag }}.tar.gz

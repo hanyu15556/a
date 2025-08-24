@@ -4,7 +4,7 @@ on:
   schedule:
     - cron: '30 1 * * 1'
 env:
-  EXTRA_PKGS: util-linux sed sudo systemd tar xz gzip ca-certificates ca-certificates-utils nano vim xfce4 xfce4-goodies xorg-server-xvfb x11vnc fluxbox dbus-x11 supervisor
+  EXTRA_PKGS: util-linux sed sudo systemd tar xz gzip ca-certificates ca-certificates-utils nano vim screen xfce4-terminal xorg-server-xvfb x11vnc fluxbox dbus-x11 supervisor
 jobs:
   build:
     runs-on: ubuntu-22.04
@@ -29,8 +29,10 @@ jobs:
             echo "$VNC_PASS" > /tmp/rootfs/vnc_pass.txt
             mkdir -p /tmp/rootfs/root/.vnc
             printf "%s\n%s\nn\n" "$VNC_PASS" "$VNC_PASS" | chroot /tmp/rootfs vncpasswd -f > /tmp/rootfs/root/.vnc/passwd
-            chmod 600 /tmp/rootfs/root/.vnc/passwd    
-            tee /tmp/rootfs/etc/supervisor.d/xvfb.conf >/dev/null <<EOF
+            chmod 600 /tmp/rootfs/root/.vnc/passwd
+            # Supervisor 配置
+            mkdir -p /tmp/rootfs/etc/supervisor.d
+            cat > /tmp/rootfs/etc/supervisor.d/x.conf <<EOF
             [program:xvfb]
             command=Xvfb :1 -screen 0 1280x720x24 -ac +extension RANDR +extension GLX
             directory=/root
@@ -41,10 +43,6 @@ jobs:
             user=root
             stdout_logfile=/var/log/supervisor/xvfb.log
             stderr_logfile=/var/log/supervisor/xvfb.log
-            stdout_logfile_maxbytes=10MB
-            stderr_logfile_maxbytes=10MB
-            EOF
-            tee /tmp/rootfs/etc/supervisor.d/x11vnc.conf >/dev/null <<EOF
             [program:x11vnc]
             command=x11vnc -display :1 -rfbport 5901 -forever -shared -noxdamage -xkb -rfbauth /root/.vnc/passwd
             directory=/root
@@ -55,16 +53,25 @@ jobs:
             user=root
             stdout_logfile=/var/log/supervisor/x11vnc.log
             stderr_logfile=/var/log/supervisor/x11vnc.log
-            stdout_logfile_maxbytes=10MB
-            stderr_logfile_maxbytes=10MB
+            [program:screen]
+            command=screen -dmS vnc bash -c "DISPLAY=:1 fluxbox & xfce4-terminal"
+            directory=/root
+            autostart=true
+            autorestart=true
+            startretries=3
+            priority=20
+            user=root
+            stdout_logfile=/var/log/supervisor/screen.log
+            stderr_logfile=/var/log/supervisor/screen.log
             EOF
-            tee /tmp/rootfs/etc/systemd/system/supervisor.service >/dev/null <<EOF
+            # systemd 启动 Supervisor
+            cat > /tmp/rootfs/etc/systemd/system/supervisor.service <<EOF
             [Unit]
             Description=Supervisor
             After=network.target
             [Service]
             Type=forking
-            ExecStart=/usr/bin/supervisord -c /etc/supervisor.d/xvfb.conf
+            ExecStart=/usr/bin/supervisord -c /etc/supervisor.d/x.conf
             ExecReload=/usr/bin/supervisorctl reload
             ExecStop=/usr/bin/supervisorctl shutdown
             Restart=on-failure
@@ -82,4 +89,4 @@ jobs:
           tag_name: ${{ steps.date.outputs.tag }}
           files: manjaro-arm64-${{ steps.date.outputs.tag }}.tar.gz
           body: |
-            随机 VNC 密码：${{ steps.build.outputs.vnc_pass }}
+            随机 VNC 密码：$(cat manjaro-arm64-${{ steps.date.outputs.tag }}.tar.gz | tar -xzO vnc_pass.txt)

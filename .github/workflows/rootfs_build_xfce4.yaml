@@ -1,38 +1,85 @@
-name: manjaro-arm64-xfce-rootfs
-on: {workflow_dispatch: null, schedule: [{cron: '30 1 * * 1'}]}
+name: manjaro-arm64-rootfs
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '30 1 * * 1'
 env:
-  EXTRA_PKGS: bash pacman glibc util-linux sed sudo systemd supervisor screen tar xz gzip ca-certificates ca-certificates-utils nano vim xorg-server xorg-xinit xorg-apps xf86-video-dummy xfce4 xfce4-goodies lightdm lightdm-gtk-greeter pavucontrol pulseaudio pulseaudio-alsa networkmanager gvfs gvfs-afc gvfs-mtp gvfs-gphoto2 ttf-dejavu ttf-liberation noto-fonts-cjk x11vnc xvfb
+  EXTRA_PKGS: util-linux sed sudo systemd tar xz gzip ca-certificates ca-certificates-utils nano vim xfce4 xfce4-goodies xorg-server-xvfb x11vnc fluxbox dbus-x11 supervisor
 jobs:
   build:
     runs-on: ubuntu-22.04
-    permissions: {contents: write}
+    permissions:
+      contents: write
     steps:
       - uses: docker/setup-qemu-action@v3
-        with: {platforms: arm64}
+        with:
+          platforms: arm64
       - id: date
-        run: echo "tag=$(date +%Y%m%d)" >>"$GITHUB_OUTPUT"
+        run: echo "tag=$(date +%Y%m%d)" >> "$GITHUB_OUTPUT"
       - run: |
           docker run --rm --privileged --platform linux/arm64/v8 \
-            -e EXTRA_PKGS="$EXTRA_PKGS" -e TAG="${{ steps.date.outputs.tag }}" -v "$PWD":/out \
-            manjarolinux/base:latest bash -euxc '
+            -e EXTRA_PKGS="$EXTRA_PKGS" -e TAG="${{ steps.date.outputs.tag }}" \
+            -v "$PWD":/out manjarolinux/base:latest bash -euxc '
             pacman -Sy --noconfirm arch-install-scripts
-            pacman-key --init
-            pacman-key --populate manjaro archlinuxarm
+            pacman-key --init && pacman-key --populate manjaro archlinuxarm
             mkdir -p /tmp/rootfs
             pacstrap -c -G -M /tmp/rootfs base ${EXTRA_PKGS}
-            arch-chroot /tmp/rootfs /bin/bash -euxc "
-              rm -f /etc/machine-id
-              systemctl enable NetworkManager supervisor
-              mkdir -p /etc/x11vnc
-              echo 123456 | x11vnc -storepasswd /etc/x11vnc/passwd
-              printf \"[supervisord]\nnodaemon=false\nuser=root\nlogfile=/var/log/supervisor.log\n[xvfb]\ncommand=/usr/bin/Xvfb :1 -screen 0 1920x1080x24 -ac -nolisten tcp\nautostart=true\nautorestart=true\nenvironment=DISPLAY=:1\n[x11vnc]\ncommand=/usr/bin/x11vnc -display :1 -forever -shared -noxdamage -rfbport 5901 -rfbauth /etc/x11vnc/passwd\nautostart=true\nautorestart=true\n[xfce-in-screen]\ncommand=/usr/bin/screen -DmS xfce /usr/bin/startxfce4\nautostart=true\nautorestart=true\nenvironment=DISPLAY=:1\n\" > /etc/supervisord.conf
-              pacman -Scc --noconfirm
-            "
-            tar --numeric-owner -czpf /out/manjaro-arm64-xfce-${TAG}.tar.gz -C /tmp/rootfs .
+            ln -sf /usr/share/zoneinfo/Asia/Shanghai /tmp/rootfs/etc/localtime
+            VNC_PASS=$(openssl rand -base64 16)
+            echo "$VNC_PASS" > /tmp/rootfs/vnc_pass.txt
+            mkdir -p /tmp/rootfs/root/.vnc
+            printf "%s\n%s\nn\n" "$VNC_PASS" "$VNC_PASS" | chroot /tmp/rootfs vncpasswd -f > /tmp/rootfs/root/.vnc/passwd
+            chmod 600 /tmp/rootfs/root/.vnc/passwd    
+            tee /tmp/rootfs/etc/supervisor.d/xvfb.conf >/dev/null <<EOF
+            [program:xvfb]
+            command=Xvfb :1 -screen 0 1280x720x24 -ac +extension RANDR +extension GLX
+            directory=/root
+            autostart=true
+            autorestart=true
+            startretries=5
+            priority=1
+            user=root
+            stdout_logfile=/var/log/supervisor/xvfb.log
+            stderr_logfile=/var/log/supervisor/xvfb.log
+            stdout_logfile_maxbytes=10MB
+            stderr_logfile_maxbytes=10MB
+            EOF
+            tee /tmp/rootfs/etc/supervisor.d/x11vnc.conf >/dev/null <<EOF
+            [program:x11vnc]
+            command=x11vnc -display :1 -rfbport 5901 -forever -shared -noxdamage -xkb -rfbauth /root/.vnc/passwd
+            directory=/root
+            autostart=true
+            autorestart=true
+            startretries=3
+            priority=10
+            user=root
+            stdout_logfile=/var/log/supervisor/x11vnc.log
+            stderr_logfile=/var/log/supervisor/x11vnc.log
+            stdout_logfile_maxbytes=10MB
+            stderr_logfile_maxbytes=10MB
+            EOF
+            tee /tmp/rootfs/etc/systemd/system/supervisor.service >/dev/null <<EOF
+            [Unit]
+            Description=Supervisor
+            After=network.target
+            [Service]
+            Type=forking
+            ExecStart=/usr/bin/supervisord -c /etc/supervisor.d/xvfb.conf
+            ExecReload=/usr/bin/supervisorctl reload
+            ExecStop=/usr/bin/supervisorctl shutdown
+            Restart=on-failure
+            User=root
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+            chroot /tmp/rootfs systemctl enable supervisor.service
+            rm -f /tmp/rootfs/etc/machine-id
+            pacman -Scc --noconfirm -r /tmp/rootfs
+            tar --numeric-owner -czpf /out/manjaro-arm64-${TAG}.tar.gz -C /tmp/rootfs .
+            '
       - uses: softprops/action-gh-release@v0.1.15
         with:
           tag_name: ${{ steps.date.outputs.tag }}
-          files: manjaro-arm64-xfce-${{ steps.date.outputs.tag }}.tar.gz
+          files: manjaro-arm64-${{ steps.date.outputs.tag }}.tar.gz
           body: |
-            Manjaro ARM64 rootfs with XFCE + supervisor + screen + x11vnc
-            VNC 5901 password 123456
+            随机 VNC 密码：${{ steps.build.outputs.vnc_pass }}

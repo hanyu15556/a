@@ -1,4 +1,4 @@
-name: manjaro-arm64-xfce4-rootfs
+name: manjaro-arm64-xfce-rootfs
 
 on:
   workflow_dispatch:
@@ -7,60 +7,94 @@ on:
 
 env:
   EXTRA_PKGS: >
-    util-linux sed sudo systemd supervisor tar xz gzip ca-certificates ca-certificates-utils nano vim
-    xfce4 xfce4-goodies lightdm lightdm-gtk-greeter
-    noto-fonts noto-fonts-cjk noto-fonts-emoji
-    ttf-dejavu ttf-liberation wqy-zenhei wqy-microhei
-    glmark2 mesa-demos pavucontrol pulseaudio dbus-x11
-    gcc clang cmake make fakeroot-tcp base-devel go git
+    bash pacman glibc
+    util-linux sed sudo systemd supervisor screen
+    tar xz gzip ca-certificates ca-certificates-utils
+    nano vim
+    xorg-server xorg-xinit xorg-apps xf86-video-dummy
+    xfce4 xfce4-goodies
+    lightdm lightdm-gtk-greeter
+    pavucontrol pulseaudio pulseaudio-alsa
+    networkmanager
+    gvfs gvfs-afc gvfs-mtp gvfs-gphoto2
+    ttf-dejavu ttf-liberation noto-fonts-cjk
+    x11vnc xvfb
 
 jobs:
-  rootfs:
+  build:
     runs-on: ubuntu-22.04
     permissions:
       contents: write
     steps:
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-qemu-action@v3
         with:
           platforms: arm64
 
-      - name: Generate date tag
-        id: date
+      - id: date
         run: echo "tag=$(date +%Y%m%d)" >> "$GITHUB_OUTPUT"
 
-      - name: Build rootfs inside arm64 container
-        run: |
+      - run: |
           docker run --rm --privileged --platform linux/arm64/v8 \
-            -e EXTRA_PKGS -e TAG="${{ steps.date.outputs.tag }}" \
-            -v "$PWD":/out manjarolinux/base:latest bash -euxc '
-            pacman -Sy --noconfirm arch-install-scripts
-            pacman-key --init
-            pacman-key --populate manjaro archlinuxarm
-            mkdir -p /tmp/rootfs
-            pacstrap -c -G -M /tmp/rootfs base ${EXTRA_PKGS}
+            -e EXTRA_PKGS="$EXTRA_PKGS" \
+            -e TAG="${{ steps.date.outputs.tag }}" \
+            -v "$PWD":/out \
+            manjarolinux/base:latest bash -euxc '
+              pacman -Sy --noconfirm arch-install-scripts
+              pacman-key --init
+              pacman-key --populate manjaro archlinuxarm
 
-            # 安装 yay-bin，然后删除临时用户
-            arch-chroot /tmp/rootfs /bin/bash -euxc "
-              useradd -m builder
-              echo \"builder ALL=(ALL) NOPASSWD: ALL\" >> /etc/sudoers
-              su - builder -c '
-                git clone https://aur.archlinux.org/yay-bin.git /tmp/yay-bin
-                cd /tmp/yay-bin && makepkg -si --noconfirm
-              '
-              pacman -U --noconfirm /tmp/yay-bin/*.pkg.tar.zst
-              rm -rf /tmp/yay-bin
-              userdel -r builder
-            "
+              mkdir -p /tmp/rootfs
+              pacstrap -c -G -M /tmp/rootfs base ${EXTRA_PKGS}
 
-            # 清理
-            rm -f /tmp/rootfs/etc/machine-id
-            pacman -Scc --noconfirm -r /tmp/rootfs
-            tar --numeric-owner -czpf /out/manjaro-arm64-xfce4-${TAG}.tar.gz -C /tmp/rootfs .
-          '
+              arch-chroot /tmp/rootfs /bin/bash -euxc "
+                rm -f /etc/machine-id
 
-      - name: Release
-        uses: softprops/action-gh-release@v0.1.15
+                useradd -m -G wheel -s /bin/bash build
+                echo build:build | chpasswd
+                echo '%wheel ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/wheel
+
+                systemctl enable NetworkManager
+                systemctl enable supervisor
+
+                mkdir -p /etc/x11vnc
+                echo 123456 | x11vnc -storepasswd /etc/x11vnc/passwd
+
+                cat >/etc/supervisord.conf <<EOF
+                [supervisord]
+                nodaemon=false
+                user=root
+                logfile=/var/log/supervisor.log
+
+                [program:xvfb]
+                command=/usr/bin/Xvfb :1 -screen 0 1920x1080x24 -ac -nolisten tcp
+                autostart=true
+                autorestart=true
+                environment=DISPLAY=\":1\"
+
+                [program:x11vnc]
+                command=/usr/bin/x11vnc -display :1 -forever -shared -noxdamage -rfbport 5901 -rfbauth /etc/x11vnc/passwd
+                autostart=true
+                autorestart=true
+
+                [program:xfce-in-screen]
+                command=/usr/bin/screen -DmS xfce /usr/bin/startxfce4
+                autostart=true
+                autorestart=true
+                user=build
+                environment=DISPLAY=\":1\"
+             EOF
+
+                pacman -Scc --noconfirm
+              "
+
+              tar --numeric-owner -czpf /out/manjaro-arm64-xfce-${TAG}.tar.gz -C /tmp/rootfs .
+            '
+
+      - uses: softprops/action-gh-release@v0.1.15
         with:
           tag_name: ${{ steps.date.outputs.tag }}
-          files: manjaro-arm64-xfce4-${{ steps.date.outputs.tag }}.tar.gz
+          files: manjaro-arm64-xfce-${{ steps.date.outputs.tag }}.tar.gz
+          body: |
+            精简 Manjaro ARM64 rootfs（含 supervisor / screen / x11vnc）
+            默认用户：build / build
+            VNC 端口：5901，密码：123456

@@ -1,5 +1,4 @@
 name: manjaro-arm64-xfce-rootfs
-
 on:
   workflow_dispatch:
   schedule:
@@ -29,10 +28,8 @@ jobs:
       - uses: docker/setup-qemu-action@v3
         with:
           platforms: arm64
-
       - id: date
         run: echo "tag=$(date +%Y%m%d)" >> "$GITHUB_OUTPUT"
-
       - run: |
           docker run --rm --privileged --platform linux/arm64/v8 \
             -e EXTRA_PKGS="$EXTRA_PKGS" \
@@ -42,59 +39,40 @@ jobs:
               pacman -Sy --noconfirm arch-install-scripts
               pacman-key --init
               pacman-key --populate manjaro archlinuxarm
-
               mkdir -p /tmp/rootfs
               pacstrap -c -G -M /tmp/rootfs base ${EXTRA_PKGS}
-
               arch-chroot /tmp/rootfs /bin/bash -euxc "
                 rm -f /etc/machine-id
-
-                useradd -m -G wheel -s /bin/bash build
-                echo build:build | chpasswd
-                echo '%wheel ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/wheel
-
-                systemctl enable NetworkManager
-                systemctl enable supervisor
-
+                systemctl enable NetworkManager supervisor
                 mkdir -p /etc/x11vnc
                 echo 123456 | x11vnc -storepasswd /etc/x11vnc/passwd
-
-                cat >/etc/supervisord.conf <<EOF
-                [supervisord]
-                nodaemon=false
-                user=root
-                logfile=/var/log/supervisor.log
-
-                [program:xvfb]
-                command=/usr/bin/Xvfb :1 -screen 0 1920x1080x24 -ac -nolisten tcp
-                autostart=true
-                autorestart=true
-                environment=DISPLAY=\":1\"
-
-                [program:x11vnc]
-                command=/usr/bin/x11vnc -display :1 -forever -shared -noxdamage -rfbport 5901 -rfbauth /etc/x11vnc/passwd
-                autostart=true
-                autorestart=true
-
-                [program:xfce-in-screen]
-                command=/usr/bin/screen -DmS xfce /usr/bin/startxfce4
-                autostart=true
-                autorestart=true
-                user=build
-                environment=DISPLAY=\":1\"
-             EOF
-
+                printf '%s\n' \
+                  [supervisord] \
+                  nodaemon=false \
+                  user=root \
+                  logfile=/var/log/supervisor.log \
+                  [program:xvfb] \
+                  command=/usr/bin/Xvfb :1 -screen 0 1920x1080x24 -ac -nolisten tcp \
+                  autostart=true \
+                  autorestart=true \
+                  environment=DISPLAY=:1 \
+                  [program:x11vnc] \
+                  command=/usr/bin/x11vnc -display :1 -forever -shared -noxdamage -rfbport 5901 -rfbauth /etc/x11vnc/passwd \
+                  autostart=true \
+                  autorestart=true \
+                  [program:xfce-in-screen] \
+                  command=/usr/bin/screen -DmS xfce /usr/bin/startxfce4 \
+                  autostart=true \
+                  autorestart=true \
+                  environment=DISPLAY=:1 \
+                  > /etc/supervisord.conf
                 pacman -Scc --noconfirm
               "
-
               tar --numeric-owner -czpf /out/manjaro-arm64-xfce-${TAG}.tar.gz -C /tmp/rootfs .
-            '
-
       - uses: softprops/action-gh-release@v0.1.15
         with:
           tag_name: ${{ steps.date.outputs.tag }}
           files: manjaro-arm64-xfce-${{ steps.date.outputs.tag }}.tar.gz
           body: |
-            精简 Manjaro ARM64 rootfs（含 supervisor / screen / x11vnc）
-            默认用户：build / build
-            VNC 端口：5901，密码：123456
+            Manjaro ARM64 rootfs with XFCE + supervisor + screen + x11vnc
+            VNC 5901 password 123456

@@ -5,6 +5,9 @@ on:
   schedule:
     - cron: '30 2 * * 2'   # 每周二 02:30 UTC
 
+permissions:
+  contents: write          # 上传 Release 需要写权限
+
 concurrency:
   group: ${{ github.repository }}-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -12,16 +15,14 @@ concurrency:
 jobs:
   release:
     runs-on: ubuntu-22.04
-    permissions:
-      contents: write
     steps:
-      # ---------- 1. 准备时间戳 ----------
+      # ---------- 1. 时间戳 ----------
       - id: time
-        uses: boredland/get-time-action@v2.0.0
+        uses: boredland/get-time-action@v2   # 2025 实测可用
         with:
           format: 'YYYYMMDD'
 
-      # ---------- 2. 装构建依赖 ----------
+      # ---------- 2. 装依赖 ----------
       - name: install-deps
         run: |
           sudo apt-get update
@@ -32,7 +33,7 @@ jobs:
             qemu-utils qemu-efi-aarch64 qemu-system-arm qemu-user-static
           sudo pip3 install meson ninja
 
-      # ---------- 3. 编译安装官方 pacman ----------
+      # ---------- 3. 编译官方 pacman ----------
       - name: install-pacman
         env:
           PACMAN_VERSION: 6.0.2
@@ -81,7 +82,7 @@ jobs:
           sudo rm -rf "$ROOTFS"
           sudo mkdir -p "$ROOTFS"
 
-          # 2025 年唯一推荐参数：-K
+          # 2025 年最新参数：仅 -K 即可
           sudo pacstrap -K "$ROOTFS" \
             base sudo systemd \
             xfce4 xfce4-goodies \
@@ -94,17 +95,17 @@ jobs:
             ca-certificates ca-certificates-utils \
             manjaro-keyring archlinux-keyring
 
-          # 清理
+          # 清理无用文件
           sudo rm -f "$ROOTFS"/var/lib/pacman/sync/*.db.sig
           sudo arch-chroot "$ROOTFS" pacman -Scc --noconfirm
           sudo rm -f "$ROOTFS"/etc/machine-id
-          touch "$ROOTFS"/etc/machine-id
+          sudo touch "$ROOTFS"/etc/machine-id
 
           # 打包
           sudo tar -zcpf manjaro-xfce4-${{ steps.time.outputs.time }}.tar.gz -C "$ROOTFS" .
           sudo chown $USER:$USER manjaro-xfce4-${{ steps.time.outputs.time }}.tar.gz
 
-      # ---------- 7. 发布 ----------
+      # ---------- 7. 发布 Release ----------
       - name: release
         uses: softprops/action-gh-release@v0.1.15
         env:

@@ -1,92 +1,117 @@
-name: manjaro-arm64-rootfs
+name: manjaro-xfce4-rootfs
+
 on:
   workflow_dispatch:
   schedule:
-    - cron: '30 1 * * 1'
-env:
-  EXTRA_PKGS: util-linux sed sudo systemd tar xz gzip ca-certificates ca-certificates-utils nano vim screen xfce4-terminal xorg-server-xvfb x11vnc fluxbox dbus-x11 supervisor
+    - cron: '30 2 * * 2'   # 每周二 02:30 UTC
+
+concurrency:
+  group: ${{ github.repository }}-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  build:
+  release:
     runs-on: ubuntu-22.04
     permissions:
       contents: write
     steps:
-      - uses: docker/setup-qemu-action@v3
+      # ---------- 1. 准备时间戳 ----------
+      - id: time
+        uses: boredland/get-time-action@v2.0.0
         with:
-          platforms: arm64
-      - id: date
-        run: echo "tag=$(date +%Y%m%d)" >> "$GITHUB_OUTPUT"
-      - run: |
-          docker run --rm --privileged --platform linux/arm64/v8 \
-            -e EXTRA_PKGS="$EXTRA_PKGS" -e TAG="${{ steps.date.outputs.tag }}" \
-            -v "$PWD":/out manjarolinux/base:latest bash -euxc '
-            pacman -Sy --noconfirm arch-install-scripts
-            pacman-key --init && pacman-key --populate manjaro archlinuxarm
-            mkdir -p /tmp/rootfs
-            pacstrap -c -G -M /tmp/rootfs base ${EXTRA_PKGS}
-            ln -sf /usr/share/zoneinfo/Asia/Shanghai /tmp/rootfs/etc/localtime
-            VNC_PASS=$(openssl rand -base64 16)
-            echo "$VNC_PASS" > /tmp/rootfs/vnc_pass.txt
-            mkdir -p /tmp/rootfs/root/.vnc
-            printf "%s\n%s\nn\n" "$VNC_PASS" "$VNC_PASS" | chroot /tmp/rootfs vncpasswd -f > /tmp/rootfs/root/.vnc/passwd
-            chmod 600 /tmp/rootfs/root/.vnc/passwd
-            # Supervisor 配置
-            mkdir -p /tmp/rootfs/etc/supervisor.d
-            cat > /tmp/rootfs/etc/supervisor.d/x.conf <<EOF
-            [program:xvfb]
-            command=Xvfb :1 -screen 0 1280x720x24 -ac +extension RANDR +extension GLX
-            directory=/root
-            autostart=true
-            autorestart=true
-            startretries=5
-            priority=1
-            user=root
-            stdout_logfile=/var/log/supervisor/xvfb.log
-            stderr_logfile=/var/log/supervisor/xvfb.log
-            [program:x11vnc]
-            command=x11vnc -display :1 -rfbport 5901 -forever -shared -noxdamage -xkb -rfbauth /root/.vnc/passwd
-            directory=/root
-            autostart=true
-            autorestart=true
-            startretries=3
-            priority=10
-            user=root
-            stdout_logfile=/var/log/supervisor/x11vnc.log
-            stderr_logfile=/var/log/supervisor/x11vnc.log
-            [program:screen]
-            command=screen -dmS vnc bash -c "DISPLAY=:1 fluxbox & xfce4-terminal"
-            directory=/root
-            autostart=true
-            autorestart=true
-            startretries=3
-            priority=20
-            user=root
-            stdout_logfile=/var/log/supervisor/screen.log
-            stderr_logfile=/var/log/supervisor/screen.log
-            EOF
-            # systemd 启动 Supervisor
-            cat > /tmp/rootfs/etc/systemd/system/supervisor.service <<EOF
-            [Unit]
-            Description=Supervisor
-            After=network.target
-            [Service]
-            Type=forking
-            ExecStart=/usr/bin/supervisord -c /etc/supervisor.d/x.conf
-            ExecReload=/usr/bin/supervisorctl reload
-            ExecStop=/usr/bin/supervisorctl shutdown
-            Restart=on-failure
-            User=root
-            [Install]
-            WantedBy=multi-user.target
-            EOF
-            chroot /tmp/rootfs systemctl enable supervisor.service
-            rm -f /tmp/rootfs/etc/machine-id
-            pacman -Scc --noconfirm -r /tmp/rootfs
-            tar --numeric-owner -czpf /out/manjaro-arm64-${TAG}.tar.gz -C /tmp/rootfs .
-            '
-      - uses: softprops/action-gh-release@v0.1.15
+          format: 'YYYYMMDD'
+
+      # ---------- 2. 装构建依赖 ----------
+      - name: install-deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gdisk zip systemd-container bmap-tools asciidoc libarchive-tools \
+            git build-essential cmake libarchive-dev pkg-config \
+            libcurl4-openssl-dev libgpgme-dev libssl-dev fakeroot dh-autoreconf \
+            qemu-utils qemu-efi-aarch64 qemu-system-arm qemu-user-static
+          sudo pip3 install meson ninja
+
+      # ---------- 3. 编译安装官方 pacman ----------
+      - name: install-pacman
+        env:
+          PACMAN_VERSION: 6.0.2
+        run: |
+          git clone --depth 1 https://gitlab.manjaro.org/packages/core/pacman.git
+          pushd pacman
+            wget -q https://sources.archlinux.org/other/pacman/pacman-${PACMAN_VERSION}.tar.xz
+            tar -xf pacman-${PACMAN_VERSION}.tar.xz
+            pushd pacman-${PACMAN_VERSION}
+              meson setup build \
+                --prefix=/usr --buildtype=plain \
+                -Ddoc=disabled -Ddoxygen=enabled \
+                -Dscriptlet-shell=/usr/bin/bash \
+                -Dldconfig=/usr/bin/ldconfig
+              meson compile -C build
+              sudo meson install -C build
+            popd
+            sudo install -Dm644 pacman.conf /etc/pacman.conf
+            sudo install -Dm644 makepkg.conf /etc/makepkg.conf
+            sudo mkdir -p /etc/pacman.d
+            curl -Lo /tmp/mirrorlist https://gitlab.manjaro.org/manjaro-arm/applications/manjaro-arm-tools/-/raw/master/profiles/defaults/arm64/mirrorlist
+            sudo mv /tmp/mirrorlist /etc/pacman.d/mirrorlist
+          popd
+
+      # ---------- 4. 注册 qemu-user-static ----------
+      - name: qemu-binfmt
+        run: |
+          sudo wget -qO /usr/lib/binfmt.d/qemu-static.conf \
+            https://gitlab.manjaro.org/manjaro-arm/packages/manjaro-arm-qemu-static/-/raw/master/qemu-static.conf
+          sudo systemctl restart systemd-binfmt
+
+      # ---------- 5. 装 arch-install-scripts ----------
+      - name: install-arch-install-scripts
+        env:
+          VERSION: 28
+        run: |
+          wget -qO- https://github.com/archlinux/arch-install-scripts/archive/v${VERSION}.tar.gz | tar xz
+          make -C arch-install-scripts-${VERSION}
+          sudo make -C arch-install-scripts-${VERSION} PREFIX=/usr install
+
+      # ---------- 6. 生成 rootfs ----------
+      - name: build-rootfs
+        run: |
+          set -xe
+          ROOTFS=$PWD/rootfs
+          sudo rm -rf "$ROOTFS"
+          sudo mkdir -p "$ROOTFS"
+
+          # 2025 年唯一推荐参数：-K
+          sudo pacstrap -K "$ROOTFS" \
+            base sudo systemd \
+            xfce4 xfce4-goodies \
+            xorg-server xorg-apps xorg-xinit \
+            lightdm lightdm-gtk-greeter \
+            gvfs util-linux \
+            nano vim screen supervisor \
+            pavucontrol tar xz gzip sed \
+            ttf-dejavu ttf-liberation \
+            ca-certificates ca-certificates-utils \
+            manjaro-keyring archlinux-keyring
+
+          # 清理
+          sudo rm -f "$ROOTFS"/var/lib/pacman/sync/*.db.sig
+          sudo arch-chroot "$ROOTFS" pacman -Scc --noconfirm
+          sudo rm -f "$ROOTFS"/etc/machine-id
+          touch "$ROOTFS"/etc/machine-id
+
+          # 打包
+          sudo tar -zcpf manjaro-xfce4-${{ steps.time.outputs.time }}.tar.gz -C "$ROOTFS" .
+          sudo chown $USER:$USER manjaro-xfce4-${{ steps.time.outputs.time }}.tar.gz
+
+      # ---------- 7. 发布 ----------
+      - name: release
+        uses: softprops/action-gh-release@v0.1.15
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: ${{ steps.date.outputs.tag }}
-          files: manjaro-arm64-${{ steps.date.outputs.tag }}.tar.gz
-          body: |
-            随机 VNC 密码：$(cat manjaro-arm64-${{ steps.date.outputs.tag }}.tar.gz | tar -xzO vnc_pass.txt)
+          tag_name: ${{ steps.time.outputs.time }}
+          name: manjaro-xfce4-${{ steps.time.outputs.time }}
+          draft: false
+          prerelease: false
+          files: manjaro-xfce4-${{ steps.time.outputs.time }}.tar.gz

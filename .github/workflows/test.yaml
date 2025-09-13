@@ -1,0 +1,105 @@
+name: rootfs-build
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '30 1 * * 1'
+
+concurrency:
+  group: ${{ github.repository }}-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - id: time
+        uses: boredland/get-time-action@2.0.0
+        with:
+          format: 'YYYYMMDD'
+
+      - name: install host deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            gdisk zip systemd-container bmap-tools asciidoc libarchive-tools \
+            git build-essential cmake libarchive-dev pkg-config libcurl4-openssl-dev \
+            libgpgme-dev libssl-dev fakeroot dh-autoreconf \
+            qemu-utils qemu-efi-aarch64 qemu-system-arm qemu-user-static
+          sudo pip3 install meson ninja
+
+      - name: install pacman
+        run: |
+          git clone --depth 1 https://gitlab.manjaro.org/packages/core/pacman.git /tmp/pacman
+          cd /tmp/pacman
+          PACVER=$(curl -s https://sources.archlinux.org/other/pacman/ | grep -Po 'pacman-\K[\d.]+(?=\.tar\.xz)' | tail -1)
+          curl -fsSL https://sources.archlinux.org/other/pacman/pacman-${PACVER}.tar.xz | tar -xJ
+          cd pacman-${PACVER}
+          meson setup --prefix=/usr --buildtype=plain \
+            -Ddoc=disabled -Ddoxygen=enabled \
+            -Dscriptlet-shell=/usr/bin/bash \
+            -Dldconfig=/usr/bin/ldconfig build
+          meson compile -C build
+          sudo meson install -C build
+          sudo install -m644 /tmp/pacman/pacman.conf /etc/pacman.conf
+          sudo install -m644 /tmp/pacman/makepkg.conf /etc/
+          sudo mkdir -p /etc/pacman.d && sudo touch /etc/pacman.d/mirrorlist
+
+      - name: setup binfmt
+        run: |
+          curl -fsSL https://gitlab.manjaro.org/manjaro-arm/packages/manjaro-arm-qemu-static/-/raw/master/qemu-static.conf \
+            | sudo tee /usr/lib/binfmt.d/qemu-static.conf >/dev/null
+          sudo systemctl restart systemd-binfmt
+
+      - name: install arch-install-scripts
+        run: |
+          VERSION=$(curl -fsSL https://ghproxy.com/https://api.github.com/repos/archlinux/arch-install-scripts/releases/latest \
+                    | jq -r .tag_name | sed 's/^v//' || echo "30")
+          curl -fsSL https://ghproxy.com/https://github.com/archlinux/arch-install-scripts/archive/v${VERSION}.tar.gz \
+            | sudo tar -xz
+          sudo make -C arch-install-scripts-${VERSION} PREFIX=/usr install
+
+      - name: install manjaro-arm-tools
+        run: |
+          sudo rm -rf /usr/{bin,share}/manjaro-arm-* /var/{lib,cache}/manjaro-arm-tools
+          git clone --depth 1 https://gitlab.manjaro.org/manjaro-arm/applications/manjaro-arm-tools.git /tmp/mat
+          cd /tmp/mat
+          sudo install -dm755 /usr/share/manjaro-arm-tools/{lib,profiles} \
+                               /var/lib/manjaro-arm-tools/{pkg,img,tmp,profiles} \
+                               /var/cache/manjaro-arm-tools/{pkg/pkg-cache,img}
+          sudo install -Dm755 bin/* -t /usr/bin/
+          sudo install -Dm755 lib/* -t /usr/share/manjaro-arm-tools/lib/
+          sudo install -Dm644 lib/manjaro-arm-tools.conf /etc/manjaro-arm-tools/
+          sudo sed -i 's|1>/dev/null||g; s|2>/dev/null||g; s|1> /dev/null 2>&1||g' \
+               /usr/share/manjaro-arm-tools/lib/functions.sh
+
+      - name: build rootfs
+        run: |
+          sudo buildrootfs
+          ROOTFS=$(find /var/lib/manjaro-arm-tools/img -mindepth 1 -maxdepth 1 -type d | head -n1)
+          [ -z "$ROOTFS" ] && { echo "rootfs dir not found"; exit 1; }
+
+          sudo pacstrap -K -M -c "$ROOTFS" \
+            base sudo systemd pacman-mirrors networkmanager openssh \
+            ca-certificates ca-certificates-utils curl wget iproute2 iputils procps-ng \
+            util-linux gzip sed nano vim htop supervisor screen tar
+
+          # 上海时区 | ssh 不自启
+          sudo arch-chroot "$ROOTFS" ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+          sudo arch-chroot "$ROOTFS" hwclock --systohc
+          sudo arch-chroot "$ROOTFS" systemctl enable supervisor NetworkManager
+
+          sudo tar -czf manjaro-arm64-rootfs.tar.gz -C "$ROOTFS" .
+          echo "FILE_PATH=manjaro-arm64-rootfs.tar.gz" >> $GITHUB_ENV
+
+      - name: release
+        uses: softprops/action-gh-release@v0.1.15
+        with:
+          tag_name: ${{ steps.time.outputs.time }}
+          name: ${{ steps.time.outputs.time }}
+          draft: false
+          prerelease: false
+          files: ${{ env.FILE_PATH }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

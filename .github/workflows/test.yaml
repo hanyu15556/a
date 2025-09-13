@@ -1,105 +1,65 @@
-name: rootfs-build
+name: manjaro-arm64-rootfs
+
 on:
   workflow_dispatch:
   schedule:
-    - cron: '30 1 * * 1'
+    - cron: '15 3 * * 0'
 
-concurrency:
-  group: ${{ github.repository }}-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+permissions:
+  contents: write
+
+env:
+  ARCH: aarch64
+  ROOTFS_NAME: manjaro-arm64
 
 jobs:
-  release:
+  build:
     runs-on: ubuntu-22.04
-    permissions:
-      contents: write
     steps:
-      - id: time
-        uses: boredland/get-time-action@2.0.0
-        with:
-          format: 'YYYYMMDD'
+      - name: Timestamp
+        id: ts
+        run: echo "TS=$(date +%Y%m%d)" >> "$GITHUB_OUTPUT"
 
-      - name: install host deps
+      - name: Install host deps
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            gdisk zip systemd-container bmap-tools asciidoc libarchive-tools \
-            git build-essential cmake libarchive-dev pkg-config libcurl4-openssl-dev \
-            libgpgme-dev libssl-dev fakeroot dh-autoreconf \
-            qemu-utils qemu-efi-aarch64 qemu-system-arm qemu-user-static
-          sudo pip3 install meson ninja
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            arch-install-scripts qemu-user-static binfmt-support tar xz-utils
 
-      - name: install pacman
+      - name: Register qemu-user-static
+        run: sudo systemctl restart systemd-binfmt
+
+      - name: Bootstrap rootfs
         run: |
-          git clone --depth 1 https://gitlab.manjaro.org/packages/core/pacman.git /tmp/pacman
-          cd /tmp/pacman
-          PACVER=$(curl -s https://sources.archlinux.org/other/pacman/ | grep -Po 'pacman-\K[\d.]+(?=\.tar\.xz)' | tail -1)
-          curl -fsSL https://sources.archlinux.org/other/pacman/pacman-${PACVER}.tar.xz | tar -xJ
-          cd pacman-${PACVER}
-          meson setup --prefix=/usr --buildtype=plain \
-            -Ddoc=disabled -Ddoxygen=enabled \
-            -Dscriptlet-shell=/usr/bin/bash \
-            -Dldconfig=/usr/bin/ldconfig build
-          meson compile -C build
-          sudo meson install -C build
-          sudo install -m644 /tmp/pacman/pacman.conf /etc/pacman.conf
-          sudo install -m644 /tmp/pacman/makepkg.conf /etc/
-          sudo mkdir -p /etc/pacman.d && sudo touch /etc/pacman.d/mirrorlist
-
-      - name: setup binfmt
-        run: |
-          curl -fsSL https://gitlab.manjaro.org/manjaro-arm/packages/manjaro-arm-qemu-static/-/raw/master/qemu-static.conf \
-            | sudo tee /usr/lib/binfmt.d/qemu-static.conf >/dev/null
-          sudo systemctl restart systemd-binfmt
-
-      - name: install arch-install-scripts
-        run: |
-          VERSION=$(curl -fsSL https://ghproxy.com/https://api.github.com/repos/archlinux/arch-install-scripts/releases/latest \
-                    | jq -r .tag_name | sed 's/^v//' || echo "30")
-          curl -fsSL https://ghproxy.com/https://github.com/archlinux/arch-install-scripts/archive/v${VERSION}.tar.gz \
-            | sudo tar -xz
-          sudo make -C arch-install-scripts-${VERSION} PREFIX=/usr install
-
-      - name: install manjaro-arm-tools
-        run: |
-          sudo rm -rf /usr/{bin,share}/manjaro-arm-* /var/{lib,cache}/manjaro-arm-tools
-          git clone --depth 1 https://gitlab.manjaro.org/manjaro-arm/applications/manjaro-arm-tools.git /tmp/mat
-          cd /tmp/mat
-          sudo install -dm755 /usr/share/manjaro-arm-tools/{lib,profiles} \
-                               /var/lib/manjaro-arm-tools/{pkg,img,tmp,profiles} \
-                               /var/cache/manjaro-arm-tools/{pkg/pkg-cache,img}
-          sudo install -Dm755 bin/* -t /usr/bin/
-          sudo install -Dm755 lib/* -t /usr/share/manjaro-arm-tools/lib/
-          sudo install -Dm644 lib/manjaro-arm-tools.conf /etc/manjaro-arm-tools/
-          sudo sed -i 's|1>/dev/null||g; s|2>/dev/null||g; s|1> /dev/null 2>&1||g' \
-               /usr/share/manjaro-arm-tools/lib/functions.sh
-
-      - name: build rootfs
-        run: |
-          sudo buildrootfs
-          ROOTFS=$(find /var/lib/manjaro-arm-tools/img -mindepth 1 -maxdepth 1 -type d | head -n1)
-          [ -z "$ROOTFS" ] && { echo "rootfs dir not found"; exit 1; }
-
+          set -xe
+          WORK=$PWD/rootfs-build
+          ROOTFS=$WORK/${{ env.ROOTFS_NAME }}
+          sudo rm -rf "$WORK"
+          mkdir -p "$ROOTFS"
+          sudo cp /usr/bin/qemu-aarch64-static "$ROOTFS/usr/bin/"
           sudo pacstrap -K -M -c "$ROOTFS" \
-            base sudo systemd pacman-mirrors networkmanager openssh \
-            ca-certificates ca-certificates-utils curl wget iproute2 iputils procps-ng \
-            util-linux gzip sed nano vim htop supervisor screen tar
+            base systemd pacman-mirrors networkmanager nano vim busybox screen sudo \
+            util-linux supervisor ca-certificates ca-certificates-utils gzip tar xz
 
-          # 上海时区 | ssh 不自启
-          sudo arch-chroot "$ROOTFS" ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
-          sudo arch-chroot "$ROOTFS" hwclock --systohc
-          sudo arch-chroot "$ROOTFS" systemctl enable supervisor NetworkManager
+          sudo chroot "$ROOTFS" ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime
+          echo Asia/Shanghai | sudo tee "$ROOTFS/etc/timezone"
+          sudo chroot "$ROOTFS" systemctl enable NetworkManager.service
+          sudo mount --bind /proc "$ROOTFS/proc"
+          sudo mount --bind /dev  "$ROOTFS/dev"
+          sudo chroot "$ROOTFS" pacman -Scc --noconfirm
+          sudo umount -l "$ROOTFS"/{proc,dev}
+          sudo rm -f "$ROOTFS/usr/bin/qemu-aarch64-static"
 
-          sudo tar -czf manjaro-arm64-rootfs.tar.gz -C "$ROOTFS" .
-          echo "FILE_PATH=manjaro-arm64-rootfs.tar.gz" >> $GITHUB_ENV
+      - name: Pack
+        run: |
+          ARCHIVE=${{ env.ROOTFS_NAME }}-${{ steps.ts.outputs.TS }}.tar.xz
+          sudo tar -C rootfs-build -cJf "$ARCHIVE" "${{ env.ROOTFS_NAME }}"
+          sudo chown "$USER:$USER" "$ARCHIVE"
+          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
 
-      - name: release
-        uses: softprops/action-gh-release@v0.1.15
+      - name: Release
+        uses: softprops/action-gh-release@v1
         with:
-          tag_name: ${{ steps.time.outputs.time }}
-          name: ${{ steps.time.outputs.time }}
-          draft: false
-          prerelease: false
-          files: ${{ env.FILE_PATH }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: ${{ steps.ts.outputs.TS }}
+          name: Manjaro-ARM aarch64 ${{ steps.ts.outputs.TS }}
+          files: ${{ env.ARCHIVE }}
